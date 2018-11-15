@@ -20,6 +20,8 @@ std::string GetCommonDeclarations();
 
 std::optional<ProgramResult> DecompileProgram(const ProgramCode& program_code, u32 main_offset,
                                               Maxwell3D::Regs::ShaderStage stage,
-                                              const std::string& suffix);
+                                              const std::string& suffix,
+                                              const std::string& r_type = "float",
+                                              const u64 r_elements = 1);
 
 } // namespace OpenGL::GLShader::Decompiler

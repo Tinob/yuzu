@@ -231,21 +231,17 @@ public:
         UnsignedInteger,
     };
 
-    GLSLRegister(std::size_t index, const std::string& suffix) : index{index}, suffix{suffix} {}
-
-    /// Gets the GLSL type string for a register
-    static std::string GetTypeString() {
-        return "float";
-    }
-
-    /// Gets the GLSL register prefix string, used for declarations and referencing
-    static std::string GetPrefixString() {
-        return "reg_";
+    GLSLRegister(std::size_t index, const std::string& suffix, const std::string& b_type = "float")
+        : index{index}, str{GetPrefixString() + std::to_string(index) + suffix}, base_type{b_type} {
     }
 
     /// Returns a GLSL string representing the current state of the register
-    std::string GetString() const {
-        return GetPrefixString() + std::to_string(index) + '_' + suffix;
+    const std::string& GetString() const {
+        return str;
+    }
+    /// Returs the eclaration string for the register
+    std::string GetDelclaration() const {
+        return base_type + ' ' + str + " = " + base_type + "(0);";
     }
 
     /// Returns the index of the register
@@ -255,7 +251,18 @@ public:
 
 private:
     const std::size_t index;
-    const std::string& suffix;
+    const std::string str;
+    const std::string& base_type;
+
+    /// Gets the GLSL type string for a register
+    const std::string& GetTypeString() {
+        return base_type;
+    }
+
+    /// Gets the GLSL register prefix string, used for declarations and referencing
+    static const std::string GetPrefixString() {
+        return "reg";
+    }
 };
 
 enum class InternalFlag : u64 {
@@ -276,9 +283,11 @@ class GLSLRegisterManager {
 public:
     GLSLRegisterManager(ShaderWriter& shader, ShaderWriter& declarations,
                         const Maxwell3D::Regs::ShaderStage& stage, const std::string& suffix,
-                        const Tegra::Shader::Header& header)
+                        const Tegra::Shader::Header& header, const std::string& r_type,
+                        const u64 elements)
         : shader{shader}, declarations{declarations}, stage{stage}, suffix{suffix}, header{header},
-          fixed_pipeline_output_attributes_used{}, local_memory_size{0} {
+          fixed_pipeline_output_attributes_used{}, local_memory_size{0}, register_type{r_type},
+          register_elements{elements}, count_used_registers{0} {
         BuildRegisterList();
         BuildInputList();
     }
@@ -340,11 +349,11 @@ public:
      * @param dest_elem Optional, the destination element to use for the operation.
      */
     void SetRegisterToFloat(const Register& reg, u64 elem, const std::string& value,
-                            u64 dest_num_components, u64 value_num_components, bool sets_cc = false,
+                            u64 value_num_components, bool sets_cc = false,
                             bool is_saturated = false, u64 dest_elem = 0, bool precise = false) {
 
         SetRegister(reg, elem, is_saturated ? "clamp(" + value + ", 0.0, 1.0)" : value,
-                    dest_num_components, value_num_components, dest_elem, precise);
+                    value_num_components, dest_elem, precise);
         if (sets_cc) {
             const std::string nan_condition = "isnan( " + value + " )";
             SetInternalFlag(InternalFlag::NaNFlag, nan_condition);
@@ -364,16 +373,14 @@ public:
      * @param size Register size to use for conversion instructions.
      */
     void SetRegisterToInteger(const Register& reg, bool is_signed, u64 elem,
-                              const std::string& value, u64 dest_num_components,
-                              u64 value_num_components, bool sets_cc = false,
-                              bool is_saturated = false, u64 dest_elem = 0,
+                              const std::string& value, u64 value_num_components,
+                              bool sets_cc = false, bool is_saturated = false, u64 dest_elem = 0,
                               Register::Size size = Register::Size::Word) {
         ASSERT_MSG(!is_saturated, "Unimplemented");
 
         const std::string func{is_signed ? "intBitsToFloat" : "uintBitsToFloat"};
         const std::string sval = ConvertIntegerSize(value, size);
-        SetRegister(reg, elem, func + '(' + sval + ')', dest_num_components, value_num_components,
-                    dest_elem, false);
+        SetRegister(reg, elem, func + '(' + sval + ')', value_num_components, dest_elem, false);
 
         if (sets_cc) {
             const std::string zero_condition = "( " + sval + " == 0 )";
@@ -394,9 +401,9 @@ public:
      * @param dest_elem Optional, the destination element to use for the operation.
      */
     void SetRegisterToHalfFloat(const Register& reg, u64 elem, const std::string& value,
-                                Tegra::Shader::HalfMerge merge, u64 dest_num_components,
-                                u64 value_num_components, bool sets_cc = false,
-                                bool is_saturated = false, u64 dest_elem = 0) {
+                                Tegra::Shader::HalfMerge merge, u64 value_num_components,
+                                bool sets_cc = false, bool is_saturated = false,
+                                u64 dest_elem = 0) {
         ASSERT_MSG(!is_saturated, "Unimplemented");
 
         const std::string result = [&]() {
@@ -422,7 +429,7 @@ public:
             }
         }();
 
-        SetRegister(reg, elem, result, dest_num_components, value_num_components, dest_elem, false);
+        SetRegister(reg, elem, result, value_num_components, dest_elem, false);
         if (sets_cc) {
             const std::string nan_condition = "isnan( " + result + " )";
             SetInternalFlag(InternalFlag::NaNFlag, nan_condition);
@@ -480,7 +487,7 @@ public:
 
     std::string GetInternalFlag(const InternalFlag ii) const {
         const u32 code = static_cast<u32>(ii);
-        return "internalFlag_" + std::to_string(code) + suffix;
+        return "iFlag_" + std::to_string(code) + suffix;
     }
 
     void SetInternalFlag(const InternalFlag ii, const std::string& value) const {
@@ -619,9 +626,8 @@ public:
 private:
     /// Generates declarations for registers.
     void GenerateRegisters(const std::string& suffix) {
-        for (const auto& reg : regs) {
-            declarations.AddLine(GLSLRegister::GetTypeString() + ' ' + reg.GetPrefixString() +
-                                 std::to_string(reg.GetIndex()) + '_' + suffix + " = 0;");
+        for (size_t i = 0; i < count_used_registers; i++) {
+            declarations.AddLine(regs[i].GetDelclaration());
         }
         declarations.AddNewLine();
     }
@@ -757,8 +763,15 @@ private:
         if (reg == Register::ZeroIndex) {
             return "0";
         }
-
-        return regs[reg.GetSwizzledIndex(elem)].GetString();
+        u64 index = reg.GetSwizzledIndex(elem);
+        if (register_elements > 1) {
+            count_used_registers = std::max(count_used_registers, (index / register_elements) + 1);
+            return regs[index / register_elements].GetString() +
+                   GetSwizzle(index % register_elements);
+        } else {
+            count_used_registers = std::max(count_used_registers, index + 1);
+            return regs[index].GetString();
+        }
     }
 
     /**
@@ -771,8 +784,7 @@ private:
      * @param dest_elem Optional, the destination element to use for the operation.
      */
     void SetRegister(const Register& reg, u64 elem, const std::string& value,
-                     u64 dest_num_components, u64 value_num_components, u64 dest_elem,
-                     bool precise) {
+                     u64 value_num_components, u64 dest_elem, bool precise) {
         if (reg == Register::ZeroIndex) {
             LOG_CRITICAL(HW_GPU, "Cannot set Register::ZeroIndex");
             UNREACHABLE();
@@ -780,9 +792,6 @@ private:
         }
 
         std::string dest = GetRegister(reg, static_cast<u32>(dest_elem));
-        if (dest_num_components > 1) {
-            dest += GetSwizzle(elem);
-        }
 
         std::string src = '(' + value + ')';
         if (value_num_components > 1) {
@@ -805,10 +814,11 @@ private:
 
     /// Build the GLSL register list.
     void BuildRegisterList() {
-        regs.reserve(Register::NumRegisters);
+        const u64 register_count = Register::NumRegisters / register_elements;
+        regs.reserve(register_count);
 
-        for (std::size_t index = 0; index < Register::NumRegisters; ++index) {
-            regs.emplace_back(index, suffix);
+        for (std::size_t index = 0; index < register_count; ++index) {
+            regs.emplace_back(index, suffix, register_type);
         }
     }
 
@@ -956,6 +966,9 @@ private:
     std::vector<SamplerEntry> used_samplers;
     const Maxwell3D::Regs::ShaderStage& stage;
     const std::string& suffix;
+    const std::string register_type;
+    const u64 register_elements;
+    u64 count_used_registers;
     const Tegra::Shader::Header& header;
     std::unordered_set<Attribute::Index> fixed_pipeline_output_attributes_used;
     u64 local_memory_size;
@@ -964,9 +977,10 @@ private:
 class GLSLGenerator {
 public:
     GLSLGenerator(const std::set<Subroutine>& subroutines, const ProgramCode& program_code,
-                  u32 main_offset, Maxwell3D::Regs::ShaderStage stage, const std::string& suffix)
+                  u32 main_offset, Maxwell3D::Regs::ShaderStage stage, const std::string& suffix,
+                  const std::string& r_type, const u64 r_elements)
         : subroutines(subroutines), program_code(program_code), main_offset(main_offset),
-          stage(stage), suffix(suffix) {
+          stage(stage), suffix(suffix), register_type(r_type), register_elements(r_elements) {
         std::memcpy(&header, program_code.data(), sizeof(Tegra::Shader::Header));
         local_memory_size = header.GetLocalMemorySize();
         regs.SetLocalMemory(local_memory_size);
@@ -992,12 +1006,12 @@ private:
 
     /// Generates code representing a 19-bit immediate value
     static std::string GetImmediate19(const Instruction& instr) {
-        return fmt::format("uintBitsToFloat({})", instr.alu.GetImm20_19());
+        return fmt::format("uintBitsToFloat({:#x}u)", instr.alu.GetImm20_19());
     }
 
     /// Generates code representing a 32-bit immediate value
     static std::string GetImmediate32(const Instruction& instr) {
-        return fmt::format("uintBitsToFloat({})", instr.alu.GetImm20_32());
+        return fmt::format("uintBitsToFloat({:#x}u)", instr.alu.GetImm20_32());
     }
 
     /// Generates code representing a vec2 pair unpacked from a half float immediate
@@ -1223,7 +1237,7 @@ private:
         }
 
         if (dest != Tegra::Shader::Register::ZeroIndex) {
-            regs.SetRegisterToInteger(dest, true, 0, result, 1, 1, gen_cc);
+            regs.SetRegisterToInteger(dest, true, 0, result, 1, gen_cc);
         }
 
         using Tegra::Shader::PredicateResultMode;
@@ -1268,7 +1282,7 @@ private:
 
         result += ')';
 
-        regs.SetRegisterToInteger(dest, true, 0, result, 1, 1, gen_cc);
+        regs.SetRegisterToInteger(dest, true, 0, result, 1, gen_cc);
     }
 
     void WriteTexsInstruction(const Instruction& instr, const std::string& coord,
@@ -1290,12 +1304,12 @@ private:
 
             if (written_components < 2) {
                 // Write the first two swizzle components to gpr0 and gpr0+1
-                regs.SetRegisterToFloat(instr.gpr0, component, "tex_value", 1, 4, false, false,
+                regs.SetRegisterToFloat(instr.gpr0, component, "tex_value", 4, false, false,
                                         written_components % 2);
             } else {
                 ASSERT(instr.texs.HasTwoDestinations());
                 // Write the rest of the swizzle components to gpr28 and gpr28+1
-                regs.SetRegisterToFloat(instr.gpr28, component, "tex_value", 1, 4, false, false,
+                regs.SetRegisterToFloat(instr.gpr28, component, "tex_value", 4, false, false,
                                         written_components % 2);
             }
 
@@ -1523,7 +1537,7 @@ private:
             case OpCode::Id::MOV_C:
             case OpCode::Id::MOV_R: {
                 // MOV does not have neither 'abs' nor 'neg' bits.
-                regs.SetRegisterToFloat(instr.gpr0, 0, op_b, 1, 1);
+                regs.SetRegisterToFloat(instr.gpr0, 0, op_b, 1);
                 break;
             }
 
@@ -1541,8 +1555,8 @@ private:
 
                 op_b = GetOperandAbsNeg(op_b, false, instr.fmul.negate_b);
 
-                regs.SetRegisterToFloat(instr.gpr0, 0, op_a + " * " + op_b, 1, 1,
-                                        instr.generates_cc, instr.alu.saturate_d, 0, true);
+                regs.SetRegisterToFloat(instr.gpr0, 0, op_a + " * " + op_b, 1, instr.generates_cc,
+                                        instr.alu.saturate_d, 0, true);
                 break;
             }
             case OpCode::Id::FADD_C:
@@ -1551,39 +1565,39 @@ private:
                 op_a = GetOperandAbsNeg(op_a, instr.alu.abs_a, instr.alu.negate_a);
                 op_b = GetOperandAbsNeg(op_b, instr.alu.abs_b, instr.alu.negate_b);
 
-                regs.SetRegisterToFloat(instr.gpr0, 0, op_a + " + " + op_b, 1, 1,
-                                        instr.generates_cc, instr.alu.saturate_d, 0, true);
+                regs.SetRegisterToFloat(instr.gpr0, 0, op_a + " + " + op_b, 1, instr.generates_cc,
+                                        instr.alu.saturate_d, 0, true);
                 break;
             }
             case OpCode::Id::MUFU: {
                 op_a = GetOperandAbsNeg(op_a, instr.alu.abs_a, instr.alu.negate_a);
                 switch (instr.sub_op) {
                 case SubOp::Cos:
-                    regs.SetRegisterToFloat(instr.gpr0, 0, "cos(" + op_a + ')', 1, 1, false,
+                    regs.SetRegisterToFloat(instr.gpr0, 0, "cos(" + op_a + ')', 1, false,
                                             instr.alu.saturate_d, 0, true);
                     break;
                 case SubOp::Sin:
-                    regs.SetRegisterToFloat(instr.gpr0, 0, "sin(" + op_a + ')', 1, 1, false,
+                    regs.SetRegisterToFloat(instr.gpr0, 0, "sin(" + op_a + ')', 1, false,
                                             instr.alu.saturate_d, 0, true);
                     break;
                 case SubOp::Ex2:
-                    regs.SetRegisterToFloat(instr.gpr0, 0, "exp2(" + op_a + ')', 1, 1, false,
+                    regs.SetRegisterToFloat(instr.gpr0, 0, "exp2(" + op_a + ')', 1, false,
                                             instr.alu.saturate_d, 0, true);
                     break;
                 case SubOp::Lg2:
-                    regs.SetRegisterToFloat(instr.gpr0, 0, "log2(" + op_a + ')', 1, 1, false,
+                    regs.SetRegisterToFloat(instr.gpr0, 0, "log2(" + op_a + ')', 1, false,
                                             instr.alu.saturate_d, 0, true);
                     break;
                 case SubOp::Rcp:
-                    regs.SetRegisterToFloat(instr.gpr0, 0, "1.0 / " + op_a, 1, 1, false,
+                    regs.SetRegisterToFloat(instr.gpr0, 0, "1.0 / " + op_a, 1, false,
                                             instr.alu.saturate_d, 0, true);
                     break;
                 case SubOp::Rsq:
-                    regs.SetRegisterToFloat(instr.gpr0, 0, "inversesqrt(" + op_a + ')', 1, 1, false,
+                    regs.SetRegisterToFloat(instr.gpr0, 0, "inversesqrt(" + op_a + ')', 1, false,
                                             instr.alu.saturate_d, 0, true);
                     break;
                 case SubOp::Sqrt:
-                    regs.SetRegisterToFloat(instr.gpr0, 0, "sqrt(" + op_a + ')', 1, 1, false,
+                    regs.SetRegisterToFloat(instr.gpr0, 0, "sqrt(" + op_a + ')', 1, false,
                                             instr.alu.saturate_d, 0, true);
                     break;
                 default:
@@ -1605,7 +1619,7 @@ private:
                 regs.SetRegisterToFloat(instr.gpr0, 0,
                                         '(' + condition + ") ? min(" + parameters + ") : max(" +
                                             parameters + ')',
-                                        1, 1, instr.generates_cc, false, 0, true);
+                                        1, instr.generates_cc, false, 0, true);
                 break;
             }
             case OpCode::Id::RRO_C:
@@ -1613,7 +1627,7 @@ private:
             case OpCode::Id::RRO_IMM: {
                 // Currently RRO is only implemented as a register move.
                 op_b = GetOperandAbsNeg(op_b, instr.alu.abs_b, instr.alu.negate_b);
-                regs.SetRegisterToFloat(instr.gpr0, 0, op_b, 1, 1);
+                regs.SetRegisterToFloat(instr.gpr0, 0, op_b, 1);
                 LOG_WARNING(HW_GPU, "RRO instruction is incomplete");
                 break;
             }
@@ -1628,13 +1642,13 @@ private:
         case OpCode::Type::ArithmeticImmediate: {
             switch (opcode->get().GetId()) {
             case OpCode::Id::MOV32_IMM: {
-                regs.SetRegisterToFloat(instr.gpr0, 0, GetImmediate32(instr), 1, 1);
+                regs.SetRegisterToFloat(instr.gpr0, 0, GetImmediate32(instr), 1);
                 break;
             }
             case OpCode::Id::FMUL32_IMM: {
                 regs.SetRegisterToFloat(
                     instr.gpr0, 0,
-                    regs.GetRegisterAsFloat(instr.gpr8) + " * " + GetImmediate32(instr), 1, 1,
+                    regs.GetRegisterAsFloat(instr.gpr8) + " * " + GetImmediate32(instr), 1,
                     instr.op_32.generates_cc, instr.fmul32.saturate, 0, true);
                 break;
             }
@@ -1658,7 +1672,7 @@ private:
                     op_b = "-(" + op_b + ')';
                 }
 
-                regs.SetRegisterToFloat(instr.gpr0, 0, op_a + " + " + op_b, 1, 1,
+                regs.SetRegisterToFloat(instr.gpr0, 0, op_a + " + " + op_b, 1,
                                         instr.op_32.generates_cc, false, 0, true);
                 break;
             }
@@ -1679,8 +1693,7 @@ private:
                     '(' + inner_shift + " >> " +
                     std::to_string(instr.bfe.GetLeftShiftValue() + instr.bfe.shift_position) + ')';
 
-                regs.SetRegisterToInteger(instr.gpr0, true, 0, outer_shift, 1, 1,
-                                          instr.generates_cc);
+                regs.SetRegisterToInteger(instr.gpr0, true, 0, outer_shift, 1, instr.generates_cc);
                 break;
             }
             default: {
@@ -1717,13 +1730,13 @@ private:
 
                 // Cast to int is superfluous for arithmetic shift, it's only for a logical shift
                 regs.SetRegisterToInteger(instr.gpr0, true, 0, "int(" + op_a + " >> " + op_b + ')',
-                                          1, 1, instr.generates_cc);
+                                          1, instr.generates_cc);
                 break;
             }
             case OpCode::Id::SHL_C:
             case OpCode::Id::SHL_R:
             case OpCode::Id::SHL_IMM:
-                regs.SetRegisterToInteger(instr.gpr0, true, 0, op_a + " << " + op_b, 1, 1,
+                regs.SetRegisterToInteger(instr.gpr0, true, 0, op_a + " << " + op_b, 1,
                                           instr.generates_cc);
                 break;
             default: {
@@ -1742,7 +1755,7 @@ private:
                 if (instr.iadd32i.negate_a)
                     op_a = "-(" + op_a + ')';
 
-                regs.SetRegisterToInteger(instr.gpr0, true, 0, op_a + " + " + op_b, 1, 1,
+                regs.SetRegisterToInteger(instr.gpr0, true, 0, op_a + " + " + op_b, 1,
                                           instr.op_32.generates_cc, instr.iadd32i.saturate);
                 break;
             case OpCode::Id::LOP32I: {
@@ -1789,7 +1802,7 @@ private:
                 if (instr.alu_integer.negate_b)
                     op_b = "-(" + op_b + ')';
 
-                regs.SetRegisterToInteger(instr.gpr0, true, 0, op_a + " + " + op_b, 1, 1,
+                regs.SetRegisterToInteger(instr.gpr0, true, 0, op_a + " + " + op_b, 1,
                                           instr.generates_cc, instr.alu.saturate_d);
                 break;
             }
@@ -1851,7 +1864,7 @@ private:
                     result = '(' + op_a + " + " + op_b + " + " + op_c + ')';
                 }
 
-                regs.SetRegisterToInteger(instr.gpr0, true, 0, result, 1, 1, instr.generates_cc);
+                regs.SetRegisterToInteger(instr.gpr0, true, 0, result, 1, instr.generates_cc);
                 break;
             }
             case OpCode::Id::ISCADD_C:
@@ -1866,7 +1879,7 @@ private:
                 const std::string shift = std::to_string(instr.alu_integer.shift_amount.Value());
 
                 regs.SetRegisterToInteger(instr.gpr0, true, 0,
-                                          "((" + op_a + " << " + shift + ") + " + op_b + ')', 1, 1,
+                                          "((" + op_a + " << " + shift + ") + " + op_b + ')', 1,
                                           instr.generates_cc);
                 break;
             }
@@ -1885,7 +1898,7 @@ private:
                 const std::string condition =
                     GetPredicateCondition(instr.sel.pred, instr.sel.neg_pred != 0);
                 regs.SetRegisterToInteger(instr.gpr0, true, 0,
-                                          '(' + condition + ") ? " + op_a + " : " + op_b, 1, 1);
+                                          '(' + condition + ") ? " + op_a + " : " + op_b, 1);
                 break;
             }
             case OpCode::Id::LOP_C:
@@ -1928,7 +1941,7 @@ private:
                 regs.SetRegisterToInteger(instr.gpr0, instr.imnmx.is_signed, 0,
                                           '(' + condition + ") ? min(" + parameters + ") : max(" +
                                               parameters + ')',
-                                          1, 1, instr.generates_cc);
+                                          1, instr.generates_cc);
                 break;
             }
             case OpCode::Id::LEA_R2:
@@ -1993,7 +2006,7 @@ private:
                     UNREACHABLE();
                 }
                 const std::string value = '(' + op_a + " + (" + op_b + "*(1 << " + op_c + ")))";
-                regs.SetRegisterToInteger(instr.gpr0, true, 0, value, 1, 1);
+                regs.SetRegisterToInteger(instr.gpr0, true, 0, value, 1);
 
                 break;
             }
@@ -2054,7 +2067,7 @@ private:
                 }
             }();
 
-            regs.SetRegisterToHalfFloat(instr.gpr0, 0, result, instr.alu_half.merge, 1, 1, false,
+            regs.SetRegisterToHalfFloat(instr.gpr0, 0, result, instr.alu_half.merge, 1, false,
                                         instr.alu_half.saturate);
             break;
         }
@@ -2084,8 +2097,8 @@ private:
                 }
             }();
 
-            regs.SetRegisterToHalfFloat(instr.gpr0, 0, result, instr.alu_half_imm.merge, 1, 1,
-                                        false, instr.alu_half_imm.saturate);
+            regs.SetRegisterToHalfFloat(instr.gpr0, 0, result, instr.alu_half_imm.merge, 1, false,
+                                        instr.alu_half_imm.saturate);
             break;
         }
         case OpCode::Type::Ffma: {
@@ -2129,7 +2142,7 @@ private:
             }
 
             regs.SetRegisterToFloat(instr.gpr0, 0, "fma(" + op_a + ", " + op_b + ", " + op_c + ')',
-                                    1, 1, instr.generates_cc, instr.alu.saturate_d, 0, true);
+                                    1, instr.generates_cc, instr.alu.saturate_d, 0, true);
             break;
         }
         case OpCode::Type::Hfma2: {
@@ -2182,7 +2195,8 @@ private:
 
             const std::string result = '(' + op_a + " * " + op_b + " + " + op_c + ')';
 
-            regs.SetRegisterToHalfFloat(instr.gpr0, 0, result, instr.hfma2.merge, 1, 1, false, saturate);
+            regs.SetRegisterToHalfFloat(instr.gpr0, 0, result, instr.hfma2.merge, 1, false,
+                                        saturate);
             break;
         }
         case OpCode::Type::Conversion: {
@@ -2202,7 +2216,7 @@ private:
                 }
 
                 regs.SetRegisterToInteger(instr.gpr0, instr.conversion.is_output_signed, 0, op_a, 1,
-                                          1, instr.generates_cc, instr.alu.saturate_d, 0,
+                                          instr.generates_cc, instr.alu.saturate_d, 0,
                                           instr.conversion.dest_size);
                 break;
             }
@@ -2233,7 +2247,7 @@ private:
                     op_a = "-(" + op_a + ')';
                 }
 
-                regs.SetRegisterToFloat(instr.gpr0, 0, op_a, 1, 1, instr.generates_cc);
+                regs.SetRegisterToFloat(instr.gpr0, 0, op_a, 1, instr.generates_cc);
                 break;
             }
             case OpCode::Id::F2F_R: {
@@ -2271,7 +2285,7 @@ private:
                     break;
                 }
 
-                regs.SetRegisterToFloat(instr.gpr0, 0, op_a, 1, 1, instr.generates_cc,
+                regs.SetRegisterToFloat(instr.gpr0, 0, op_a, 1, instr.generates_cc,
                                         instr.alu.saturate_d);
                 break;
             }
@@ -2321,8 +2335,7 @@ private:
                 }
 
                 regs.SetRegisterToInteger(instr.gpr0, instr.conversion.is_output_signed, 0, op_a, 1,
-                                          1, instr.generates_cc, false, 0,
-                                          instr.conversion.dest_size);
+                                          instr.generates_cc, false, 0, instr.conversion.dest_size);
                 break;
             }
             default: {
@@ -2383,15 +2396,15 @@ private:
 
                 switch (instr.ld_c.type.Value()) {
                 case Tegra::Shader::UniformType::Single:
-                    regs.SetRegisterToFloat(instr.gpr0, 0, op_a, 1, 1);
+                    regs.SetRegisterToFloat(instr.gpr0, 0, op_a, 1);
                     break;
 
                 case Tegra::Shader::UniformType::Double: {
                     const std::string op_b =
                         regs.GetUniformIndirect(instr.cbuf36.index, instr.cbuf36.offset + 4,
                                                 "index", GLSLRegister::Type::Float);
-                    regs.SetRegisterToFloat(instr.gpr0, 0, op_a, 1, 1);
-                    regs.SetRegisterToFloat(instr.gpr0.Value() + 1, 0, op_b, 1, 1);
+                    regs.SetRegisterToFloat(instr.gpr0, 0, op_a, 1);
+                    regs.SetRegisterToFloat(instr.gpr0.Value() + 1, 0, op_b, 1);
                     break;
                 }
                 default:
@@ -2425,7 +2438,7 @@ private:
 
                 switch (instr.ldst_sl.type.Value()) {
                 case Tegra::Shader::StoreType::Bytes32:
-                    regs.SetRegisterToFloat(instr.gpr0, 0, op_a, 1, 1);
+                    regs.SetRegisterToFloat(instr.gpr0, 0, op_a, 1);
                     break;
                 default:
                     LOG_CRITICAL(HW_GPU, "LD_L Unhandled type: {}",
@@ -2643,12 +2656,12 @@ private:
                             // Skip disabled components
                             continue;
                         }
-                        regs.SetRegisterToFloat(instr.gpr0, elem, "tex_value", 1, 4, false, false,
+                        regs.SetRegisterToFloat(instr.gpr0, elem, "tex_value", 4, false, false,
                                                 dest_elem);
                         ++dest_elem;
                     }
                 } else {
-                    regs.SetRegisterToFloat(instr.gpr0, 0, "tex_value", 1, 1);
+                    regs.SetRegisterToFloat(instr.gpr0, 0, "tex_value", 1);
                 }
                 --shader.scope;
                 shader.AddLine("}");
@@ -2863,18 +2876,20 @@ private:
                 const std::string texture = "textureGather(" + sampler + ", coords, " +
                                             std::to_string(instr.tld4.component) + ')';
                 if (!depth_compare) {
+                    shader.AddLine("vec4 tex_value = " + texture + ";");
                     std::size_t dest_elem{};
                     for (std::size_t elem = 0; elem < 4; ++elem) {
                         if (!instr.tex.IsComponentEnabled(elem)) {
                             // Skip disabled components
                             continue;
                         }
-                        regs.SetRegisterToFloat(instr.gpr0, elem, texture, 1, 4, false, false,
+                        regs.SetRegisterToFloat(instr.gpr0, elem, "tex_value", 4, false, false,
                                                 dest_elem);
                         ++dest_elem;
                     }
                 } else {
-                    regs.SetRegisterToFloat(instr.gpr0, 0, texture, 1, 1);
+                    shader.AddLine("float tex_value = " + texture + ";");
+                    regs.SetRegisterToFloat(instr.gpr0, 0, "tex_value", 1);
                 }
                 --shader.scope;
                 shader.AddLine("}");
@@ -2923,7 +2938,7 @@ private:
                 switch (instr.txq.query_type) {
                 case Tegra::Shader::TextureQueryType::Dimension: {
                     const std::string texture = "textureQueryLevels(" + sampler + ')';
-                    regs.SetRegisterToInteger(instr.gpr0, true, 0, texture, 1, 1);
+                    regs.SetRegisterToInteger(instr.gpr0, true, 0, texture, 1);
                     break;
                 }
                 default: {
@@ -2978,8 +2993,8 @@ private:
                 const std::string tmp = "vec2 tmp = " + texture + "*vec2(256.0, 256.0);";
                 shader.AddLine(tmp);
 
-                regs.SetRegisterToInteger(instr.gpr0, true, 0, "int(tmp.y)", 1, 1);
-                regs.SetRegisterToInteger(instr.gpr0.Value() + 1, false, 0, "uint(tmp.x)", 1, 1);
+                regs.SetRegisterToInteger(instr.gpr0, true, 0, "int(tmp.y)", 1);
+                regs.SetRegisterToInteger(instr.gpr0.Value() + 1, false, 0, "uint(tmp.x)", 1);
                 --shader.scope;
                 shader.AddLine('}');
                 break;
@@ -3132,10 +3147,10 @@ private:
             const std::string result = '(' + predicate + ") " + combiner + " (" + second_pred + ')';
             if (instr.pset.bf == 0) {
                 const std::string value = '(' + result + ") ? 0xFFFFFFFF : 0";
-                regs.SetRegisterToInteger(instr.gpr0, false, 0, value, 1, 1, instr.generates_cc);
+                regs.SetRegisterToInteger(instr.gpr0, false, 0, value, 1, instr.generates_cc);
             } else {
                 const std::string value = '(' + result + ") ? 1.0 : 0.0";
-                regs.SetRegisterToFloat(instr.gpr0, 0, value, 1, 1, instr.generates_cc);
+                regs.SetRegisterToFloat(instr.gpr0, 0, value, 1, instr.generates_cc);
             }
             break;
         }
@@ -3225,10 +3240,9 @@ private:
                                           ") " + combiner + " (" + second_pred + "))";
 
             if (instr.fset.bf) {
-                regs.SetRegisterToFloat(instr.gpr0, 0, predicate + " ? 1.0 : 0.0", 1, 1);
+                regs.SetRegisterToFloat(instr.gpr0, 0, predicate + " ? 1.0 : 0.0", 1);
             } else {
-                regs.SetRegisterToInteger(instr.gpr0, false, 0, predicate + " ? 0xFFFFFFFF : 0", 1,
-                                          1);
+                regs.SetRegisterToInteger(instr.gpr0, false, 0, predicate + " ? 0xFFFFFFFF : 0", 1);
             }
             break;
         }
@@ -3260,10 +3274,9 @@ private:
                                           ") " + combiner + " (" + second_pred + "))";
 
             if (instr.iset.bf) {
-                regs.SetRegisterToFloat(instr.gpr0, 0, predicate + " ? 1.0 : 0.0", 1, 1);
+                regs.SetRegisterToFloat(instr.gpr0, 0, predicate + " ? 1.0 : 0.0", 1);
             } else {
-                regs.SetRegisterToInteger(instr.gpr0, false, 0, predicate + " ? 0xFFFFFFFF : 0", 1,
-                                          1);
+                regs.SetRegisterToInteger(instr.gpr0, false, 0, predicate + " ? 0xFFFFFFFF : 0", 1);
             }
             break;
         }
@@ -3308,7 +3321,7 @@ private:
                     result += " | ";
                 }
             }
-            regs.SetRegisterToInteger(instr.gpr0, false, 0, '(' + result + ')', 1, 1);
+            regs.SetRegisterToInteger(instr.gpr0, false, 0, '(' + result + ')', 1);
             break;
         }
         case OpCode::Type::Xmad: {
@@ -3401,7 +3414,7 @@ private:
                 sum = "((" + sum + " & 0xFFFF) | (" + src2 + "<< 16))";
             }
 
-            regs.SetRegisterToInteger(instr.gpr0, is_signed, 0, sum, 1, 1, instr.generates_cc);
+            regs.SetRegisterToInteger(instr.gpr0, is_signed, 0, sum, 1, instr.generates_cc);
             break;
         }
         default: {
@@ -3471,7 +3484,7 @@ private:
                     const std::string next = "((" + current + " + 1" + ") % " +
                                              std::to_string(MAX_GEOMETRY_BUFFERS) + ')';
                     shader.AddLine("emit_vertex(" + current + ");");
-                    regs.SetRegisterToInteger(instr.gpr0, false, 0, next, 1, 1);
+                    regs.SetRegisterToInteger(instr.gpr0, false, 0, next, 1);
                 }
                 if (instr.out.cut) {
                     shader.AddLine("EndPrimitive();");
@@ -3483,7 +3496,7 @@ private:
                 switch (instr.sys20) {
                 case Tegra::Shader::SystemVariable::InvocationInfo: {
                     LOG_WARNING(HW_GPU, "MOV_SYS instruction with InvocationInfo is incomplete");
-                    regs.SetRegisterToInteger(instr.gpr0, false, 0, "0u", 1, 1);
+                    regs.SetRegisterToInteger(instr.gpr0, false, 0, "0u", 1);
                     break;
                 }
                 default: {
@@ -3502,7 +3515,7 @@ private:
                 ASSERT_MSG(stage == Maxwell3D::Regs::ShaderStage::Geometry,
                            "ISBERD is expected to be used in a geometry shader.");
                 LOG_WARNING(HW_GPU, "ISBERD instruction is incomplete");
-                regs.SetRegisterToFloat(instr.gpr0, 0, regs.GetRegisterAsFloat(instr.gpr8), 1, 1);
+                regs.SetRegisterToFloat(instr.gpr0, 0, regs.GetRegisterAsFloat(instr.gpr8), 1);
                 break;
             }
             case OpCode::Id::BRA: {
@@ -3527,8 +3540,7 @@ private:
                                                 input_mode);
 
                 if (instr.ipa.saturate) {
-                    regs.SetRegisterToFloat(reg, 0, regs.GetRegisterAsFloat(reg), 1, 1, false,
-                                            true);
+                    regs.SetRegisterToFloat(reg, 0, regs.GetRegisterAsFloat(reg), 1, false, true);
                 }
                 break;
             }
@@ -3595,7 +3607,7 @@ private:
                     break;
                 }
 
-                regs.SetRegisterToInteger(instr.gpr0, result_signed, 1, result, 1, 1, instr.vmad.cc,
+                regs.SetRegisterToInteger(instr.gpr0, result_signed, 1, result, 1, instr.vmad.cc,
                                           instr.vmad.saturate, 0, Register::Size::Word);
                 break;
             }
@@ -3751,10 +3763,13 @@ private:
     Maxwell3D::Regs::ShaderStage stage;
     const std::string& suffix;
     u64 local_memory_size;
+    const std::string& register_type;
+    const u64 register_elements;
 
     ShaderWriter shader;
     ShaderWriter declarations;
-    GLSLRegisterManager regs{shader, declarations, stage, suffix, header};
+    GLSLRegisterManager regs{shader,        declarations,     stage, suffix, header,
+                             register_type, register_elements};
 
     // Declarations
     std::set<std::string> declr_predicates;
@@ -3767,11 +3782,13 @@ std::string GetCommonDeclarations() {
 
 std::optional<ProgramResult> DecompileProgram(const ProgramCode& program_code, u32 main_offset,
                                               Maxwell3D::Regs::ShaderStage stage,
-                                              const std::string& suffix) {
+                                              const std::string& suffix, const std::string& r_type,
+                                              const u64 r_elements) {
     try {
         const auto subroutines =
             ControlFlowAnalyzer(program_code, main_offset, suffix).GetSubroutines();
-        GLSLGenerator generator(subroutines, program_code, main_offset, stage, suffix);
+        GLSLGenerator generator(subroutines, program_code, main_offset, stage, suffix, r_type,
+                                r_elements);
         return ProgramResult{generator.GetShaderCode(), generator.GetEntries()};
     } catch (const DecompileFail& exception) {
         LOG_ERROR(HW_GPU, "Shader decompilation failed: {}", exception.what());
