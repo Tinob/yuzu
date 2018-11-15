@@ -22,6 +22,6 @@ std::optional<ProgramResult> DecompileProgram(const ProgramCode& program_code, u
                                               Maxwell3D::Regs::ShaderStage stage,
                                               const std::string& suffix,
                                               const std::string& r_type = "float",
-                                              const u64 r_elements = 1);
+                                              const u64 r_elements = 1, bool comments = true);
 
 } // namespace OpenGL::GLShader::Decompiler

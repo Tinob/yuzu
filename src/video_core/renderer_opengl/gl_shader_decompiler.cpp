@@ -978,9 +978,10 @@ class GLSLGenerator {
 public:
     GLSLGenerator(const std::set<Subroutine>& subroutines, const ProgramCode& program_code,
                   u32 main_offset, Maxwell3D::Regs::ShaderStage stage, const std::string& suffix,
-                  const std::string& r_type, const u64 r_elements)
+                  const std::string& r_type, const u64 r_elements, bool comments)
         : subroutines(subroutines), program_code(program_code), main_offset(main_offset),
-          stage(stage), suffix(suffix), register_type(r_type), register_elements(r_elements) {
+          stage(stage), suffix(suffix), register_type(r_type), register_elements(r_elements),
+          enable_comments(comments) {
         std::memcpy(&header, program_code.data(), sizeof(Tegra::Shader::Header));
         local_memory_size = header.GetLocalMemorySize();
         regs.SetLocalMemory(local_memory_size);
@@ -1496,10 +1497,10 @@ private:
             UNREACHABLE();
             return offset + 1;
         }
-
-        shader.AddLine(
-            fmt::format("// {}: {} (0x{:016x})", offset, opcode->get().GetName(), instr.value));
-
+        if (enable_comments) {
+            shader.AddLine(
+                fmt::format("// {}: {} (0x{:016x})", offset, opcode->get().GetName(), instr.value));
+        }
         using Tegra::Shader::Pred;
         ASSERT_MSG(instr.pred.full_pred != Pred::NeverExecute,
                    "NeverExecute predicate not implemented");
@@ -3765,6 +3766,7 @@ private:
     u64 local_memory_size;
     const std::string& register_type;
     const u64 register_elements;
+    const bool enable_comments;
 
     ShaderWriter shader;
     ShaderWriter declarations;
@@ -3783,12 +3785,12 @@ std::string GetCommonDeclarations() {
 std::optional<ProgramResult> DecompileProgram(const ProgramCode& program_code, u32 main_offset,
                                               Maxwell3D::Regs::ShaderStage stage,
                                               const std::string& suffix, const std::string& r_type,
-                                              const u64 r_elements) {
+                                              const u64 r_elements, bool comments) {
     try {
         const auto subroutines =
             ControlFlowAnalyzer(program_code, main_offset, suffix).GetSubroutines();
         GLSLGenerator generator(subroutines, program_code, main_offset, stage, suffix, r_type,
-                                r_elements);
+                                r_elements, comments);
         return ProgramResult{generator.GetShaderCode(), generator.GetEntries()};
     } catch (const DecompileFail& exception) {
         LOG_ERROR(HW_GPU, "Shader decompilation failed: {}", exception.what());
