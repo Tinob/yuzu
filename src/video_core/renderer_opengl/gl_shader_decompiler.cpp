@@ -340,11 +340,16 @@ public:
      * @param dest_elem Optional, the destination element to use for the operation.
      */
     void SetRegisterToFloat(const Register& reg, u64 elem, const std::string& value,
-                            u64 dest_num_components, u64 value_num_components,
+                            u64 dest_num_components, u64 value_num_components, bool sets_cc = false,
                             bool is_saturated = false, u64 dest_elem = 0, bool precise = false) {
 
         SetRegister(reg, elem, is_saturated ? "clamp(" + value + ", 0.0, 1.0)" : value,
                     dest_num_components, value_num_components, dest_elem, precise);
+        if (sets_cc) {
+            const std::string nan_condition = "isnan( " + value + " )";
+            SetInternalFlag(InternalFlag::NaNFlag, nan_condition);
+            LOG_WARNING(HW_GPU, "Control Codes Imcomplete.");
+        }
     }
 
     /**
@@ -360,18 +365,18 @@ public:
      */
     void SetRegisterToInteger(const Register& reg, bool is_signed, u64 elem,
                               const std::string& value, u64 dest_num_components,
-                              u64 value_num_components, bool is_saturated = false,
-                              u64 dest_elem = 0, Register::Size size = Register::Size::Word,
-                              bool sets_cc = false) {
+                              u64 value_num_components, bool sets_cc = false,
+                              bool is_saturated = false, u64 dest_elem = 0,
+                              Register::Size size = Register::Size::Word) {
         ASSERT_MSG(!is_saturated, "Unimplemented");
 
         const std::string func{is_signed ? "intBitsToFloat" : "uintBitsToFloat"};
-
-        SetRegister(reg, elem, func + '(' + ConvertIntegerSize(value, size) + ')',
-                    dest_num_components, value_num_components, dest_elem, false);
+        const std::string sval = ConvertIntegerSize(value, size);
+        SetRegister(reg, elem, func + '(' + sval + ')', dest_num_components, value_num_components,
+                    dest_elem, false);
 
         if (sets_cc) {
-            const std::string zero_condition = "( " + ConvertIntegerSize(value, size) + " == 0 )";
+            const std::string zero_condition = "( " + sval + " == 0 )";
             SetInternalFlag(InternalFlag::ZeroFlag, zero_condition);
             LOG_WARNING(HW_GPU, "Control Codes Imcomplete.");
         }
@@ -390,8 +395,8 @@ public:
      */
     void SetRegisterToHalfFloat(const Register& reg, u64 elem, const std::string& value,
                                 Tegra::Shader::HalfMerge merge, u64 dest_num_components,
-                                u64 value_num_components, bool is_saturated = false,
-                                u64 dest_elem = 0) {
+                                u64 value_num_components, bool sets_cc = false,
+                                bool is_saturated = false, u64 dest_elem = 0) {
         ASSERT_MSG(!is_saturated, "Unimplemented");
 
         const std::string result = [&]() {
@@ -406,10 +411,10 @@ public:
                 // pack. I couldn't test this on hardware but it shouldn't really matter since most
                 // of the time when a Mrg_* flag is used both components will be mirrored. That
                 // being said, it deserves a test.
-                return "((" + GetRegisterAsInteger(reg, 0, false) +
+                return "uintBitsToFloat((" + GetRegisterAsInteger(reg, 0, false) +
                        " & 0xffff0000) | (packHalf2x16(" + value + ") & 0x0000ffff))";
             case Tegra::Shader::HalfMerge::Mrg_H1:
-                return "((" + GetRegisterAsInteger(reg, 0, false) +
+                return "uintBitsToFloat((" + GetRegisterAsInteger(reg, 0, false) +
                        " & 0x0000ffff) | (packHalf2x16(" + value + ") & 0xffff0000))";
             default:
                 UNREACHABLE();
@@ -418,6 +423,10 @@ public:
         }();
 
         SetRegister(reg, elem, result, dest_num_components, value_num_components, dest_elem, false);
+        if (sets_cc) {
+            const std::string nan_condition = "isnan( " + result + " )";
+            SetInternalFlag(InternalFlag::NaNFlag, nan_condition);
+        }
     }
 
     /**
@@ -432,7 +441,7 @@ public:
     void SetRegisterToInputAttibute(const Register& reg, u64 elem, Attribute::Index attribute,
                                     const Tegra::Shader::IpaMode& input_mode,
                                     std::optional<Register> vertex = {}) {
-        const std::string dest = GetRegisterAsFloat(reg);
+        const std::string dest = GetRegister(reg, 0);
         const std::string src = GetInputAttribute(attribute, input_mode, vertex) + GetSwizzle(elem);
         shader.AddLine(dest + " = " + src + ';');
     }
@@ -460,6 +469,8 @@ public:
         switch (cc) {
         case Tegra::Shader::ControlCode::NEU:
             return "!(" + GetInternalFlag(InternalFlag::ZeroFlag) + ')';
+        case Tegra::Shader::ControlCode::Nan:
+            return '(' + GetInternalFlag(InternalFlag::NaNFlag) + ')';
         default:
             LOG_CRITICAL(HW_GPU, "Unimplemented Control Code {}", static_cast<u32>(cc));
             UNREACHABLE();
@@ -544,6 +555,8 @@ public:
             return value;
         } else if (type == GLSLRegister::Type::Integer) {
             return "floatBitsToInt(" + value + ')';
+        } else if (type == GLSLRegister::Type::UnsignedInteger) {
+            return "floatBitsToUint(" + value + ')';
         } else {
             UNREACHABLE();
         }
@@ -1185,7 +1198,7 @@ private:
     void WriteLogicOperation(Register dest, LogicOperation logic_op, const std::string& op_a,
                              const std::string& op_b,
                              Tegra::Shader::PredicateResultMode predicate_mode,
-                             Tegra::Shader::Pred predicate) {
+                             Tegra::Shader::Pred predicate, bool gen_cc = false) {
         std::string result{};
         switch (logic_op) {
         case LogicOperation::And: {
@@ -1210,7 +1223,7 @@ private:
         }
 
         if (dest != Tegra::Shader::Register::ZeroIndex) {
-            regs.SetRegisterToInteger(dest, true, 0, result, 1, 1);
+            regs.SetRegisterToInteger(dest, true, 0, result, 1, 1, gen_cc);
         }
 
         using Tegra::Shader::PredicateResultMode;
@@ -1231,7 +1244,8 @@ private:
     }
 
     void WriteLop3Instruction(Register dest, const std::string& op_a, const std::string& op_b,
-                              const std::string& op_c, const std::string& imm_lut) {
+                              const std::string& op_c, const std::string& imm_lut,
+                              bool gen_cc = false) {
         if (dest == Tegra::Shader::Register::ZeroIndex) {
             return;
         }
@@ -1254,7 +1268,7 @@ private:
 
         result += ')';
 
-        regs.SetRegisterToInteger(dest, true, 0, result, 1, 1);
+        regs.SetRegisterToInteger(dest, true, 0, result, 1, 1, gen_cc);
     }
 
     void WriteTexsInstruction(const Instruction& instr, const std::string& coord,
@@ -1264,7 +1278,7 @@ private:
         shader.AddLine('{');
         ++shader.scope;
         shader.AddLine(coord);
-
+        shader.AddLine("vec4 tex_value = " + texture + ";");
         // TEXS has two destination registers and a swizzle. The first two elements in the swizzle
         // go into gpr0+0 and gpr0+1, and the rest goes into gpr28+0 and gpr28+1
 
@@ -1276,12 +1290,12 @@ private:
 
             if (written_components < 2) {
                 // Write the first two swizzle components to gpr0 and gpr0+1
-                regs.SetRegisterToFloat(instr.gpr0, component, texture, 1, 4, false,
+                regs.SetRegisterToFloat(instr.gpr0, component, "tex_value", 1, 4, false, false,
                                         written_components % 2);
             } else {
                 ASSERT(instr.texs.HasTwoDestinations());
                 // Write the rest of the swizzle components to gpr28 and gpr28+1
-                regs.SetRegisterToFloat(instr.gpr28, component, texture, 1, 4, false,
+                regs.SetRegisterToFloat(instr.gpr28, component, "tex_value", 1, 4, false, false,
                                         written_components % 2);
             }
 
@@ -1524,16 +1538,11 @@ private:
                 ASSERT_MSG(instr.fmul.tab5c68_0 == 1, "FMUL tab5cb8_0({}) is not implemented",
                            instr.fmul.tab5c68_0
                                .Value()); // SMO typical sends 1 here which seems to be the default
-                ASSERT_MSG(instr.fmul.cc == 0, "FMUL cc is not implemented");
 
                 op_b = GetOperandAbsNeg(op_b, false, instr.fmul.negate_b);
 
                 regs.SetRegisterToFloat(instr.gpr0, 0, op_a + " * " + op_b, 1, 1,
-                                        instr.alu.saturate_d, 0, true);
-                if (instr.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "FMUL Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
+                                        instr.generates_cc, instr.alu.saturate_d, 0, true);
                 break;
             }
             case OpCode::Id::FADD_C:
@@ -1543,42 +1552,38 @@ private:
                 op_b = GetOperandAbsNeg(op_b, instr.alu.abs_b, instr.alu.negate_b);
 
                 regs.SetRegisterToFloat(instr.gpr0, 0, op_a + " + " + op_b, 1, 1,
-                                        instr.alu.saturate_d, 0, true);
-                if (instr.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "FADD Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
+                                        instr.generates_cc, instr.alu.saturate_d, 0, true);
                 break;
             }
             case OpCode::Id::MUFU: {
                 op_a = GetOperandAbsNeg(op_a, instr.alu.abs_a, instr.alu.negate_a);
                 switch (instr.sub_op) {
                 case SubOp::Cos:
-                    regs.SetRegisterToFloat(instr.gpr0, 0, "cos(" + op_a + ')', 1, 1,
+                    regs.SetRegisterToFloat(instr.gpr0, 0, "cos(" + op_a + ')', 1, 1, false,
                                             instr.alu.saturate_d, 0, true);
                     break;
                 case SubOp::Sin:
-                    regs.SetRegisterToFloat(instr.gpr0, 0, "sin(" + op_a + ')', 1, 1,
+                    regs.SetRegisterToFloat(instr.gpr0, 0, "sin(" + op_a + ')', 1, 1, false,
                                             instr.alu.saturate_d, 0, true);
                     break;
                 case SubOp::Ex2:
-                    regs.SetRegisterToFloat(instr.gpr0, 0, "exp2(" + op_a + ')', 1, 1,
+                    regs.SetRegisterToFloat(instr.gpr0, 0, "exp2(" + op_a + ')', 1, 1, false,
                                             instr.alu.saturate_d, 0, true);
                     break;
                 case SubOp::Lg2:
-                    regs.SetRegisterToFloat(instr.gpr0, 0, "log2(" + op_a + ')', 1, 1,
+                    regs.SetRegisterToFloat(instr.gpr0, 0, "log2(" + op_a + ')', 1, 1, false,
                                             instr.alu.saturate_d, 0, true);
                     break;
                 case SubOp::Rcp:
-                    regs.SetRegisterToFloat(instr.gpr0, 0, "1.0 / " + op_a, 1, 1,
+                    regs.SetRegisterToFloat(instr.gpr0, 0, "1.0 / " + op_a, 1, 1, false,
                                             instr.alu.saturate_d, 0, true);
                     break;
                 case SubOp::Rsq:
-                    regs.SetRegisterToFloat(instr.gpr0, 0, "inversesqrt(" + op_a + ')', 1, 1,
+                    regs.SetRegisterToFloat(instr.gpr0, 0, "inversesqrt(" + op_a + ')', 1, 1, false,
                                             instr.alu.saturate_d, 0, true);
                     break;
                 case SubOp::Sqrt:
-                    regs.SetRegisterToFloat(instr.gpr0, 0, "sqrt(" + op_a + ')', 1, 1,
+                    regs.SetRegisterToFloat(instr.gpr0, 0, "sqrt(" + op_a + ')', 1, 1, false,
                                             instr.alu.saturate_d, 0, true);
                     break;
                 default:
@@ -1600,11 +1605,7 @@ private:
                 regs.SetRegisterToFloat(instr.gpr0, 0,
                                         '(' + condition + ") ? min(" + parameters + ") : max(" +
                                             parameters + ')',
-                                        1, 1, false, 0, true);
-                if (instr.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "FMNMX Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
+                                        1, 1, instr.generates_cc, false, 0, true);
                 break;
             }
             case OpCode::Id::RRO_C:
@@ -1631,14 +1632,10 @@ private:
                 break;
             }
             case OpCode::Id::FMUL32_IMM: {
-                regs.SetRegisterToFloat(instr.gpr0, 0,
-                                        regs.GetRegisterAsFloat(instr.gpr8) + " * " +
-                                            GetImmediate32(instr),
-                                        1, 1, instr.fmul32.saturate, 0, true);
-                if (instr.op_32.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "FMUL32 Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
+                regs.SetRegisterToFloat(
+                    instr.gpr0, 0,
+                    regs.GetRegisterAsFloat(instr.gpr8) + " * " + GetImmediate32(instr), 1, 1,
+                    instr.op_32.generates_cc, instr.fmul32.saturate, 0, true);
                 break;
             }
             case OpCode::Id::FADD32I: {
@@ -1661,11 +1658,8 @@ private:
                     op_b = "-(" + op_b + ')';
                 }
 
-                regs.SetRegisterToFloat(instr.gpr0, 0, op_a + " + " + op_b, 1, 1, false, 0, true);
-                if (instr.op_32.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "FADD32 Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
+                regs.SetRegisterToFloat(instr.gpr0, 0, op_a + " + " + op_b, 1, 1,
+                                        instr.op_32.generates_cc, false, 0, true);
                 break;
             }
             }
@@ -1685,11 +1679,8 @@ private:
                     '(' + inner_shift + " >> " +
                     std::to_string(instr.bfe.GetLeftShiftValue() + instr.bfe.shift_position) + ')';
 
-                regs.SetRegisterToInteger(instr.gpr0, true, 0, outer_shift, 1, 1);
-                if (instr.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "BFE Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
+                regs.SetRegisterToInteger(instr.gpr0, true, 0, outer_shift, 1, 1,
+                                          instr.generates_cc);
                 break;
             }
             default: {
@@ -1726,21 +1717,14 @@ private:
 
                 // Cast to int is superfluous for arithmetic shift, it's only for a logical shift
                 regs.SetRegisterToInteger(instr.gpr0, true, 0, "int(" + op_a + " >> " + op_b + ')',
-                                          1, 1);
-                if (instr.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "SHR Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
+                                          1, 1, instr.generates_cc);
                 break;
             }
             case OpCode::Id::SHL_C:
             case OpCode::Id::SHL_R:
             case OpCode::Id::SHL_IMM:
-                regs.SetRegisterToInteger(instr.gpr0, true, 0, op_a + " << " + op_b, 1, 1);
-                if (instr.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "SHL Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
+                regs.SetRegisterToInteger(instr.gpr0, true, 0, op_a + " << " + op_b, 1, 1,
+                                          instr.generates_cc);
                 break;
             default: {
                 LOG_CRITICAL(HW_GPU, "Unhandled shift instruction: {}", opcode->get().GetName());
@@ -1759,11 +1743,7 @@ private:
                     op_a = "-(" + op_a + ')';
 
                 regs.SetRegisterToInteger(instr.gpr0, true, 0, op_a + " + " + op_b, 1, 1,
-                                          instr.iadd32i.saturate != 0);
-                if (instr.op_32.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "IADD32 Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
+                                          instr.op_32.generates_cc, instr.iadd32i.saturate);
                 break;
             case OpCode::Id::LOP32I: {
                 if (instr.alu.lop32i.invert_a)
@@ -1774,11 +1754,7 @@ private:
 
                 WriteLogicOperation(instr.gpr0, instr.alu.lop32i.operation, op_a, op_b,
                                     Tegra::Shader::PredicateResultMode::None,
-                                    Tegra::Shader::Pred::UnusedIndex);
-                if (instr.op_32.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "LOP32I Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
+                                    Tegra::Shader::Pred::UnusedIndex, instr.op_32.generates_cc);
                 break;
             }
             default: {
@@ -1814,11 +1790,7 @@ private:
                     op_b = "-(" + op_b + ')';
 
                 regs.SetRegisterToInteger(instr.gpr0, true, 0, op_a + " + " + op_b, 1, 1,
-                                          instr.alu.saturate_d);
-                if (instr.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "IADD Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
+                                          instr.generates_cc, instr.alu.saturate_d);
                 break;
             }
             case OpCode::Id::IADD3_C:
@@ -1879,12 +1851,7 @@ private:
                     result = '(' + op_a + " + " + op_b + " + " + op_c + ')';
                 }
 
-                regs.SetRegisterToInteger(instr.gpr0, true, 0, result, 1, 1);
-
-                if (instr.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "IADD3 Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
+                regs.SetRegisterToInteger(instr.gpr0, true, 0, result, 1, 1, instr.generates_cc);
                 break;
             }
             case OpCode::Id::ISCADD_C:
@@ -1899,11 +1866,8 @@ private:
                 const std::string shift = std::to_string(instr.alu_integer.shift_amount.Value());
 
                 regs.SetRegisterToInteger(instr.gpr0, true, 0,
-                                          "((" + op_a + " << " + shift + ") + " + op_b + ')', 1, 1);
-                if (instr.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "ISCADD Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
+                                          "((" + op_a + " << " + shift + ") + " + op_b + ')', 1, 1,
+                                          instr.generates_cc);
                 break;
             }
             case OpCode::Id::POPC_C:
@@ -1934,11 +1898,8 @@ private:
                     op_b = "~(" + op_b + ')';
 
                 WriteLogicOperation(instr.gpr0, instr.alu.lop.operation, op_a, op_b,
-                                    instr.alu.lop.pred_result_mode, instr.alu.lop.pred48);
-                if (instr.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "LOP Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
+                                    instr.alu.lop.pred_result_mode, instr.alu.lop.pred48,
+                                    instr.generates_cc);
                 break;
             }
             case OpCode::Id::LOP3_C:
@@ -1953,11 +1914,7 @@ private:
                     lut = '(' + std::to_string(instr.alu.lop3.GetImmLut48()) + ')';
                 }
 
-                WriteLop3Instruction(instr.gpr0, op_a, op_b, op_c, lut);
-                if (instr.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "LOP3 Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
+                WriteLop3Instruction(instr.gpr0, op_a, op_b, op_c, lut, instr.generates_cc);
                 break;
             }
             case OpCode::Id::IMNMX_C:
@@ -1971,11 +1928,7 @@ private:
                 regs.SetRegisterToInteger(instr.gpr0, instr.imnmx.is_signed, 0,
                                           '(' + condition + ") ? min(" + parameters + ") : max(" +
                                               parameters + ')',
-                                          1, 1);
-                if (instr.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "IMNMX Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
+                                          1, 1, instr.generates_cc);
                 break;
             }
             case OpCode::Id::LEA_R2:
@@ -2101,8 +2054,8 @@ private:
                 }
             }();
 
-            regs.SetRegisterToHalfFloat(instr.gpr0, 0, result, instr.alu_half.merge, 1, 1,
-                                        instr.alu_half.saturate != 0);
+            regs.SetRegisterToHalfFloat(instr.gpr0, 0, result, instr.alu_half.merge, 1, 1, false,
+                                        instr.alu_half.saturate);
             break;
         }
         case OpCode::Type::ArithmeticHalfImmediate: {
@@ -2132,7 +2085,7 @@ private:
             }();
 
             regs.SetRegisterToHalfFloat(instr.gpr0, 0, result, instr.alu_half_imm.merge, 1, 1,
-                                        instr.alu_half_imm.saturate != 0);
+                                        false, instr.alu_half_imm.saturate);
             break;
         }
         case OpCode::Type::Ffma: {
@@ -2176,12 +2129,7 @@ private:
             }
 
             regs.SetRegisterToFloat(instr.gpr0, 0, "fma(" + op_a + ", " + op_b + ", " + op_c + ')',
-                                    1, 1, instr.alu.saturate_d, 0, true);
-            if (instr.generates_cc) {
-                LOG_CRITICAL(HW_GPU, "FFMA Generates an unhandled Control Code");
-                UNREACHABLE();
-            }
-
+                                    1, 1, instr.generates_cc, instr.alu.saturate_d, 0, true);
             break;
         }
         case OpCode::Type::Hfma2: {
@@ -2234,7 +2182,7 @@ private:
 
             const std::string result = '(' + op_a + " * " + op_b + " + " + op_c + ')';
 
-            regs.SetRegisterToHalfFloat(instr.gpr0, 0, result, instr.hfma2.merge, 1, 1, saturate);
+            regs.SetRegisterToHalfFloat(instr.gpr0, 0, result, instr.hfma2.merge, 1, 1, false, saturate);
             break;
         }
         case OpCode::Type::Conversion: {
@@ -2254,8 +2202,8 @@ private:
                 }
 
                 regs.SetRegisterToInteger(instr.gpr0, instr.conversion.is_output_signed, 0, op_a, 1,
-                                          1, instr.alu.saturate_d, 0, instr.conversion.dest_size,
-                                          instr.generates_cc.Value() != 0);
+                                          1, instr.generates_cc, instr.alu.saturate_d, 0,
+                                          instr.conversion.dest_size);
                 break;
             }
             case OpCode::Id::I2F_R:
@@ -2285,12 +2233,7 @@ private:
                     op_a = "-(" + op_a + ')';
                 }
 
-                regs.SetRegisterToFloat(instr.gpr0, 0, op_a, 1, 1);
-
-                if (instr.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "I2F Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
+                regs.SetRegisterToFloat(instr.gpr0, 0, op_a, 1, 1, instr.generates_cc);
                 break;
             }
             case OpCode::Id::F2F_R: {
@@ -2328,12 +2271,8 @@ private:
                     break;
                 }
 
-                regs.SetRegisterToFloat(instr.gpr0, 0, op_a, 1, 1, instr.alu.saturate_d);
-
-                if (instr.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "F2F Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
+                regs.SetRegisterToFloat(instr.gpr0, 0, op_a, 1, 1, instr.generates_cc,
+                                        instr.alu.saturate_d);
                 break;
             }
             case OpCode::Id::F2I_R:
@@ -2382,11 +2321,8 @@ private:
                 }
 
                 regs.SetRegisterToInteger(instr.gpr0, instr.conversion.is_output_signed, 0, op_a, 1,
-                                          1, false, 0, instr.conversion.dest_size);
-                if (instr.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "F2I Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
+                                          1, instr.generates_cc, false, 0,
+                                          instr.conversion.dest_size);
                 break;
             }
             default: {
@@ -2699,6 +2635,7 @@ private:
                     UNREACHABLE();
                 }
                 }
+                shader.AddLine("vec4 tex_value = " + texture + ";");
                 if (!depth_compare) {
                     std::size_t dest_elem{};
                     for (std::size_t elem = 0; elem < 4; ++elem) {
@@ -2706,11 +2643,12 @@ private:
                             // Skip disabled components
                             continue;
                         }
-                        regs.SetRegisterToFloat(instr.gpr0, elem, texture, 1, 4, false, dest_elem);
+                        regs.SetRegisterToFloat(instr.gpr0, elem, "tex_value", 1, 4, false, false,
+                                                dest_elem);
                         ++dest_elem;
                     }
                 } else {
-                    regs.SetRegisterToFloat(instr.gpr0, 0, texture, 1, 1, false);
+                    regs.SetRegisterToFloat(instr.gpr0, 0, "tex_value", 1, 1);
                 }
                 --shader.scope;
                 shader.AddLine("}");
@@ -2931,11 +2869,12 @@ private:
                             // Skip disabled components
                             continue;
                         }
-                        regs.SetRegisterToFloat(instr.gpr0, elem, texture, 1, 4, false, dest_elem);
+                        regs.SetRegisterToFloat(instr.gpr0, elem, texture, 1, 4, false, false,
+                                                dest_elem);
                         ++dest_elem;
                     }
                 } else {
-                    regs.SetRegisterToFloat(instr.gpr0, 0, texture, 1, 1, false);
+                    regs.SetRegisterToFloat(instr.gpr0, 0, texture, 1, 1);
                 }
                 --shader.scope;
                 shader.AddLine("}");
@@ -3193,17 +3132,11 @@ private:
             const std::string result = '(' + predicate + ") " + combiner + " (" + second_pred + ')';
             if (instr.pset.bf == 0) {
                 const std::string value = '(' + result + ") ? 0xFFFFFFFF : 0";
-                regs.SetRegisterToInteger(instr.gpr0, false, 0, value, 1, 1);
+                regs.SetRegisterToInteger(instr.gpr0, false, 0, value, 1, 1, instr.generates_cc);
             } else {
                 const std::string value = '(' + result + ") ? 1.0 : 0.0";
-                regs.SetRegisterToFloat(instr.gpr0, 0, value, 1, 1);
+                regs.SetRegisterToFloat(instr.gpr0, 0, value, 1, 1, instr.generates_cc);
             }
-
-            if (instr.generates_cc) {
-                LOG_CRITICAL(HW_GPU, "PSET Generates an unhandled Control Code");
-                UNREACHABLE();
-            }
-
             break;
         }
         case OpCode::Type::PredicateSetPredicate: {
@@ -3468,11 +3401,7 @@ private:
                 sum = "((" + sum + " & 0xFFFF) | (" + src2 + "<< 16))";
             }
 
-            regs.SetRegisterToInteger(instr.gpr0, is_signed, 0, sum, 1, 1);
-            if (instr.generates_cc) {
-                LOG_CRITICAL(HW_GPU, "XMAD Generates an unhandled Control Code");
-                UNREACHABLE();
-            }
+            regs.SetRegisterToInteger(instr.gpr0, is_signed, 0, sum, 1, 1, instr.generates_cc);
             break;
         }
         default: {
@@ -3598,7 +3527,8 @@ private:
                                                 input_mode);
 
                 if (instr.ipa.saturate) {
-                    regs.SetRegisterToFloat(reg, 0, regs.GetRegisterAsFloat(reg), 1, 1, true);
+                    regs.SetRegisterToFloat(reg, 0, regs.GetRegisterAsFloat(reg), 1, 1, false,
+                                            true);
                 }
                 break;
             }
@@ -3665,14 +3595,8 @@ private:
                     break;
                 }
 
-                regs.SetRegisterToInteger(instr.gpr0, result_signed, 1, result, 1, 1,
-                                          instr.vmad.saturate == 1, 0, Register::Size::Word,
-                                          instr.vmad.cc);
-                if (instr.generates_cc) {
-                    LOG_CRITICAL(HW_GPU, "VMAD Generates an unhandled Control Code");
-                    UNREACHABLE();
-                }
-
+                regs.SetRegisterToInteger(instr.gpr0, result_signed, 1, result, 1, 1, instr.vmad.cc,
+                                          instr.vmad.saturate, 0, Register::Size::Word);
                 break;
             }
             case OpCode::Id::VSETP: {
